@@ -11,7 +11,7 @@ class RountingEnv():
     """
     def __init__(self, G, Final_deadline):
         self.action_space = spaces.Discrete(G.number_of_nodes()) # Action space is edges available while sticking to the deadline
-        self.current_node = G.node[0]
+        self.current_node = G.nodes[0] #SWITCH TO NODES PLURAL
         self.next_node = []
         self.total_time = 0
         self.Final_deadline = Final_deadline

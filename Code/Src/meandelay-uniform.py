@@ -65,6 +65,6 @@ variance = int(os.environ['var'])
 print("Network with Uniform distribution. deadline: ",deadline,", variance: ",variance,", epsiodes: ", num_episodes)
 
 G = prsnt()
-best_path = [G.node[0]['name']]
+best_path = [G.nodes[0]['name']] #SWITCH TO NODES PLURAL
 env = RountingEnv(G, deadline)
 Q, policy = mc_prediction(make_epsilon_greedy_policy, env, G, deadline, num_episodes)

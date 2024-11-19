@@ -149,6 +149,6 @@ num_episodes = int(os.environ['num_episodes'])
 
 print("Dynamic Network with deadline ",deadline," with epsiodes", num_episodes)
 G = prsnt()
-best_path = [G.node[0]['name']]
+best_path = [G.nodes[0]['name']] #SWITCH TO NODES PLURAL
 env = RountingEnv(G, deadline)
 Q, policy = mc_prediction(make_epsilon_greedy_policy, env, G, deadline, num_episodes)
