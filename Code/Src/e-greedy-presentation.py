@@ -1,3 +1,4 @@
+#SECTION 3.1: NO VARIANCE
 import numpy as np
 import random
 import os

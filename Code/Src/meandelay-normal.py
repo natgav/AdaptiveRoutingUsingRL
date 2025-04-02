@@ -1,3 +1,4 @@
+#SECTION 3a: NORMAL DISTRIBUTION
 import numpy as np
 import random
 import os

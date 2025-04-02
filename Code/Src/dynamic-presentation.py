@@ -1,3 +1,4 @@
+#SECTION 3.2: DYNAMIC CONGESTION
 import numpy as np
 import random
 import os

@@ -1,3 +1,4 @@
+#SECTION 3b: Uniform around Mean
 import numpy as np
 import random
 import os
