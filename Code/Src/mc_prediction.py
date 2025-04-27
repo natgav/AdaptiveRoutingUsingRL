@@ -7,7 +7,7 @@ import time
 from environ import RountingEnv # The routing environment
 from collections import defaultdict # memory efficient storing of value functions
 
-def mc_prediction(policy, env,G, Final_deadline, num_episodes, discount_factor=1, alpha=0.9, epsilon=0.1):
+def mc_prediction(policy, env,G, Final_deadline, num_episodes, discount_factor=1.0, alpha=0.5, epsilon=0.2):#default discount_factor=1, alpha=0.9, epsilon=0.1
     """
     Monte Carlo prediction algorithm. Calculates the value function
     for a given policy using sampling.

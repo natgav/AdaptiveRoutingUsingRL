@@ -2,7 +2,7 @@
 
 Final_deadline=(20 25 30 35 40)
 variance=(1 2 3 4 5)
-num_episodes=1000
+num_episodes=1000 #default: 1000
 
 plot_deadline=20,25,30,35,40
 plot_variance=1,2,3,4,5
