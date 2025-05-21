@@ -145,7 +145,8 @@ def make_epsilon_greedy_policy(Q, G, epsilon, observation, deadline):
 
 
 #deadline = int(os.environ['deadline'])
-num_episodes = int(os.environ['num_episodes'])
+#num_episodes = int(os.environ['num_episodes'])
+num_episodes = int(os.environ.get('num_episodes', 1000))
 
 for num_nodes in range(5,500):
     nodes = num_nodes
@@ -155,7 +156,7 @@ for num_nodes in range(5,500):
 
     print(num_nodes," node network with deadline ",deadline," with epsiodes", num_episodes)
     start_time = time.time()
-    best_path = [G.node[0]['index']]
+    best_path = [G._node[0]['index']]
     env = RountingEnv(G, deadline)
     Q, policy = mc_prediction(make_epsilon_greedy_policy, env, G, deadline, num_episodes)
     for state,action in Q.items():
