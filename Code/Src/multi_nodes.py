@@ -5,12 +5,40 @@ import networkx as nx
 import time
 import sys
 import statistics
+import matplotlib.pyplot as plt
 
 from environ import RountingEnv # The routing environment
 from collections import defaultdict # memory efficient storing of value functions
 from network_generator import prsnt, random_dag
 
 import csv
+
+def draw_and_save_graph(G, out_png, out_pdf=None, show=False, seed=42):
+    """Draw the DAG and save it to disk (no effect on learning)."""
+    import networkx as nx
+    #pos = nx.spring_layout(G, seed=seed)
+    pos = nx.kamada_kawai_layout(G)
+
+    plt.figure(figsize=(7, 5))
+    nx.draw_networkx_nodes(G, pos, node_size=420, node_color="#D9E8FB", edgecolors="#1C3D5A")
+    nx.draw_networkx_labels(G, pos, font_size=9)
+    nx.draw_networkx_edges(G, pos, arrows=True, arrowstyle="-|>", arrowsize=12, width=1.2)
+
+    # edge labels as "tx/wc"
+    edge_labels = {(u, v): f"{d.get('tx','?')}/{d.get('wc','?')}" for u, v, d in G.edges(data=True)}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=7)
+
+    plt.axis("off")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    if out_pdf:
+        plt.savefig(out_pdf, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close()
+
+
 
 def mc_prediction(policy, env,G, Final_deadline, num_episodes, discount_factor=1.0, alpha=0.5, epsilon=0.2):#default discount_factor=1, alpha=1, epsilon=0.1
     """
@@ -89,6 +117,27 @@ def mc_prediction(policy, env,G, Final_deadline, num_episodes, discount_factor=1
     w = csv.writer(open(tx_time_file, "a+"))
     w.writerow(row)
 
+    ##NEW FOR PLOTTING##
+    # Where to write outputs for this run (provided by caller or default)
+    outdir = os.environ.get("multinodes_outdir", os.path.join("Results", "MultiNodes"))
+    os.makedirs(outdir, exist_ok=True)
+
+    # 1) tx_times.csv (per-episode totals)
+    tx_csv = os.path.join(outdir, "tx_times.csv")
+    with open(tx_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["episode", "total_time", "deadline"])
+        for ep in range(1, num_episodes + 1):
+            w.writerow([ep, float(total_time[ep]), int(Final_deadline)])
+
+    # 2) edges.csv (to redraw topology later)
+    edges_csv = os.path.join(outdir, "edges.csv")
+    with open(edges_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["u", "v", "tx", "wc"])
+        for u, v, d in G.edges(data=True):
+            w.writerow([u, v, d.get("tx", ""), d.get("wc", "")])
+
     return Q, policy
 
 def make_epsilon_greedy_policy(Q, G, epsilon, observation, deadline):
@@ -148,7 +197,7 @@ def make_epsilon_greedy_policy(Q, G, epsilon, observation, deadline):
 #num_episodes = int(os.environ['num_episodes'])
 num_episodes = int(os.environ.get('num_episodes', 1000))
 
-for num_nodes in range(5,500):
+for num_nodes in range(10, 11): #5-10 inclusive
     nodes = num_nodes
     edges = 50 * nodes
     G = random_dag(nodes,edges)
@@ -158,6 +207,21 @@ for num_nodes in range(5,500):
     start_time = time.time()
     best_path = [G._node[0]['index']]
     env = RountingEnv(G, deadline)
+
+    # NEW: where to store outputs for this graph/run
+    run_dir = os.path.join("Results", "MultiNodes",
+                           f"N{nodes}__E{edges}__dl{int(deadline)}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # NEW: save the DAG image (PNG + optional PDF)
+    draw_and_save_graph(G,
+                        out_png=os.path.join(run_dir, "graph.png"),
+                        out_pdf=os.path.join(run_dir, "graph.pdf"),
+                        show=False, seed=42)
+
+    # NEW: tell mc_prediction where to write tx_times.csv
+    os.environ["multinodes_outdir"] = run_dir
+
     Q, policy = mc_prediction(make_epsilon_greedy_policy, env, G, deadline, num_episodes)
     for state,action in Q.items():
         next_node = max(Q[state],key=Q[state].get)
