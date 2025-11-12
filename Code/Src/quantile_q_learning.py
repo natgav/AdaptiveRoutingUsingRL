@@ -1,168 +1,263 @@
 # quantile_q_learning.py
+import os, math, csv, random, time
 import numpy as np
-from collections import defaultdict
-import csv, os, time
+from collections import deque, defaultdict
 
-class QuantileTable:
+# ---------------------------
+# Utilities
+# ---------------------------
+def _make_tau(K: int):
+    # equally-spaced quantiles at midpoints: (0.5/K, 1.5/K, ..., (K-0.5)/K)
+    return (np.arange(K) + 0.5) / K
+
+def _feasible_actions(G, state, deadline):
+    feas = []
+    if state == int(G.nodes[G.number_of_nodes() - 1]['index']):
+        return feas
+    for a in G[int(state)]:
+        if G[int(state)][a]['wct'] <= deadline:
+            feas.append(a)
+    return feas
+
+def _epsilon_schedule(e0=0.2, e_min=0.01, decay_episodes=500, episode=1):
+    # multiplicative decay to e_min over decay_episodes
+    if episode >= decay_episodes: 
+        return e_min
+    r = (e_min / max(e0, 1e-9)) ** (episode / max(decay_episodes, 1))
+    return max(e_min, e0 * r)
+
+def _huber_quantile_gradient(td_matrix, taus, kappa=1.0):
     """
-    Tabular QR-Q: stores K quantiles per (state, action).
-    State = current node index (int). Action = next node index (int).
+    td_matrix: shape [K, K] with (target_z_j - pred_z_i) for all i,j
+    taus: shape [K]
+    Returns per-pred-quantile gradients: shape [K]
+    Loss is sum_j rho_tau_i^kappa(delta_ij), averaged over j. 
+    We return dL/d(pred_z_i).
     """
-    def __init__(self, num_states, num_actions, K=51, tau=None, init=0.0):
-        self.num_states = num_states
-        self.num_actions = num_actions
-        self.K = K
-        self.tau = np.linspace(1/(2*K), 1 - 1/(2*K), K) if tau is None else np.asarray(tau)
-        self.theta = defaultdict(lambda: np.zeros((num_actions, K)) + init)  # theta[s][a, k]
+    # Huber
+    abs_td = np.abs(td_matrix)
+    huber = np.where(abs_td <= kappa, 0.5 * td_matrix ** 2, kappa * (abs_td - 0.5 * kappa))
+    # gradient of huber wrt pred is: 
+    #   grad_huber = -( td if |td|<=kappa else kappa*sign(td) )
+    grad_huber = np.where(abs_td <= kappa, -td_matrix, -kappa * np.sign(td_matrix))
 
-    def mean(self, s):
-        # returns mean value per action (K-mean over quantiles)
-        qsa = self.theta[s]  # [A,K]
-        return qsa.mean(axis=1)  # [A]
+    # pinball weight (indicator[delta<0] - tau)
+    # For each row i, we need sign weights across columns j
+    indicator = (td_matrix < 0).astype(np.float64)  # shape [K, K]
+    # Broadcast taus: each row i has tau_i
+    tau_row = taus[:, None]                         # shape [K,1]
+    pinball = np.abs(tau_row - indicator)           # |tau - 1_{delta<0}|  (this equals (tau - 1_{delta<0}) with sign handled by grad_huber)
 
-    def quantile(self, s, a, q):
-        # nearest quantile index
-        idx = int(np.clip(round(q * (self.K - 1)), 0, self.K - 1))
-        return self.theta[s][a, idx]
+    # combine
+    # dL/d pred_i = mean_j pinball_ij * grad_huber_ij
+    grad = np.mean(pinball * grad_huber, axis=1)    # shape [K]
+    # loss (optional, for logging)
+    loss = np.mean(huber * pinball)
+    return grad, loss
 
-    def greedy_action(self, s, mask=None):
-        # choose action with minimal mean (delay), respecting mask (True = allowed)
-        means = self.mean(s)
-        if mask is not None:
-            # mask illegal actions with +inf
-            means = np.where(mask, means, np.inf)
-        return int(np.argmin(means))
-
-def huber(u, kappa=1.0):
-    absu = np.abs(u)
-    return np.where(absu <= kappa, 0.5 * u**2, kappa * (absu - 0.5 * kappa))
-
-def quantile_td_update(qtab: QuantileTable, s, a, r, s_next, a_next, gamma=1.0, lr=1e-2, kappa=1.0):
+# ---------------------------
+# Main trainer
+# ---------------------------
+def run_quantile_learning(
+    make_time_sampler, env, G, Final_deadline, num_episodes,
+    *,
+    omega=0.05,         # terminal slack weight (deadline - total_time)+
+    gamma=1.0,          # undiscounted aligns with paper’s episodic path cost
+    lr=2e-3,            # tabular “step size” for quantile updates
+    K=31,               # number of quantiles
+    tau_target=0.01,    # soft target update rate
+    epsilon0=0.2,       # initial ε
+    epsilon_min=0.01,   # floor
+    epsilon_decay_ep=500,
+    kappa=1.0,          # Huber threshold
+    replay_capacity=50000,
+    batch_size=64,
+    learn_start=500,    # warm-up steps before learning
+    target_update_every=1,  # update target every step (soft)
+    max_hops=100
+):
     """
-    QR Q-learning TD update with fixed taus (Dabney et al.).
+    Tabular QR-DQN style learner (but tabular, no NN).
+    We keep K quantiles per (state, action). Transitions are stored and
+    we train via Huber pinball loss against target quantiles.
+
+    make_time_sampler(state, action) -> tx draw (float or int)
+    env.step(action, tx) returns (action, reward, done, _). We ignore env.reward and compute our own:
+        r_step = -tx
+        if done and total_time <= Final_deadline: r_term += omega * (Final_deadline - total_time)
+    CSVs: resultsfile/tx_times.csv  with rows: episode,total_time
+          resultsfile/comp_times.csv (seconds per episode index)
+          resultsfile/Q_values.csv   (optional best-path snapshot per episode; off by default here)
     """
-    theta_sa = qtab.theta[s][a]                # [K]
-    target = r + gamma * qtab.theta[s_next][a_next]  # [K]
-    # Compute pairwise TD errors for all quantiles (broadcast [K,K])
-    td = target[None, :] - theta_sa[:, None]   # [K,K]
-    loss_grad = (qtab.tau[:, None] - (td < 0).astype(float)) * huber(td, kappa=kappa) / kappa
-    # gradient step: move theta_sa toward target according to quantile loss
-    grad = loss_grad.mean(axis=1)              # [K]
-    qtab.theta[s][a] += lr * grad
+    results_dir = os.environ.get('resultsfile', '')
+    if results_dir and not os.path.isdir(results_dir):
+        os.makedirs(results_dir, exist_ok=True)
 
-def epsilon_greedy_safe_action(qtab: QuantileTable, s, feasible_mask, epsilon, omega, deadline_remaining):
-    """
-    DDRL-style gate: only choose among actions whose (1-omega)-quantile <= remaining deadline.
-    Within safe set, act epsilon-greedily using the minimal mean.
-    """
-    num_actions = feasible_mask.size
-    safe = np.zeros(num_actions, dtype=bool)
-    for a in range(num_actions):
-        if feasible_mask[a]:
-            q_high = qtab.quantile(s, a, 1 - omega)
-            safe[a] = (q_high <= deadline_remaining)
+    # ---- State/Action indexing is direct (tabular over node indices)
+    n_nodes = G.number_of_nodes()
+    # storage for K quantiles per (s,a). Use dict-of-dicts for sparsity.
+    Z = defaultdict(lambda: defaultdict(lambda: np.zeros(K, dtype=np.float64)))
+    Z_tgt = defaultdict(lambda: defaultdict(lambda: np.zeros(K, dtype=np.float64)))
+    taus = _make_tau(K)
 
-    # fallback: if nothing is 'safe', use feasible set to avoid deadlocks
-    candidate_mask = safe if safe.any() else feasible_mask
+    # simple replay buffer (s,a,r,ns,done) with per-step r
+    Replay = deque(maxlen=replay_capacity)
 
-    if np.random.rand() < epsilon:
-        choices = np.where(candidate_mask)[0]
-        return int(np.random.choice(choices))
-    # greedy = minimal mean delay
-    means = qtab.mean(s)
-    means = np.where(candidate_mask, means, np.inf)
-    return int(np.argmin(means))
+    def get_quantiles(table, s, a):
+        return table[int(s)][int(a)]
 
-def run_quantile_learning(make_time_sampler,
-                          env, G, Final_deadline, num_episodes,
-                          omega=0.05, epsilon0=0.2, gamma=1.0, lr=5e-3, K=51):
-    """
-    make_time_sampler(s, a) -> time_traversed (samples distribution per experiment).
-    Writes the same CSV artifacts your TD pipeline expects.
-    """
-    qtab = QuantileTable(num_states=G.number_of_nodes(),
-                         num_actions=G.number_of_nodes(),
-                         K=K)
+    def set_quantiles_(table, s, a, new):
+        table[int(s)][int(a)] = new
 
-    eps_time = np.empty(num_episodes + 1)
-    filename = os.environ['resultsfile']
+    def expected_q(table, s, a):
+        # mean of quantiles
+        return float(np.mean(get_quantiles(table, s, a)))
 
-    for i_episode in range(1, num_episodes + 1):
-        start = time.time()
+    def greedy_action(table, s, feasible):
+        # break ties by smallest tx edge to stabilize early training
+        if not feasible:
+            return None
+        values = np.array([expected_q(table, s, a) for a in feasible], dtype=np.float64)
+        # argmax
+        idx = int(np.argmax(values))
+        return feasible[idx]
+
+    # pre-initialize quantiles to small optimistic values (encourage exploration)
+    init_q = 0.0
+    for s in G.nodes():
+        feas = _feasible_actions(G, s, Final_deadline)
+        for a in feas:
+            set_quantiles_(Z, s, a, np.full(K, init_q, dtype=np.float64))
+            set_quantiles_(Z_tgt, s, a, np.full(K, init_q, dtype=np.float64))
+
+    # logging
+    ep_comp_time = np.empty(num_episodes + 1)
+    tx_writer = None
+    if results_dir:
+        tx_writer = csv.writer(open(os.path.join(results_dir, "tx_times.csv"), "w", newline=""))
+        # header optional; TeX reads by index, so skip header to match old format.
+
+    total_steps = 0
+    rng = np.random.default_rng()
+
+    for ep in range(1, num_episodes + 1):
+        t0 = time.time()
         state = env.reset(Final_deadline)
+        deadline = env.get_deadline()
         total_time = 0.0
-        # decaying epsilon like dynamic script
-        epsilon = min(1.0, np.exp(-(i_episode / (num_episodes / 10.0))) ) * epsilon0 + 0.01
+        done = False
 
-        for t in range(100):
-            deadline = env.get_deadline()
+        eps = _epsilon_schedule(e0=epsilon0, e_min=epsilon_min, decay_episodes=epsilon_decay_ep, episode=ep)
 
-            # build feasible action mask via static wct <= deadline (your current safety gate)
-            feasible = np.zeros(G.number_of_nodes(), dtype=bool)
-            for j in G[int(state)]:
-                feasible[j] = (G[int(state)][j]['wct'] <= deadline)
-
-            # pick action using learned distributional safety (1-omega quantile)
-            action = epsilon_greedy_safe_action(qtab, state, feasible, epsilon, omega, deadline)
-
-            # sample time_traversed according to the experiment’s distribution
-            time_traversed = make_time_sampler(state, action)
-
-            # env transition (per-hop reward is -time_traversed now)
-            next_state, reward, done, _ = env.step(action, time_traversed)
-            total_time += time_traversed
-
-            # next action for on-policy QR-SARSA flavor (more stable here)
-            # choose greedy next action for target bootstrap (works fine)
-            feasible_next = np.zeros(G.number_of_nodes(), dtype=bool)
-            for j in G[int(next_state)]:
-                feasible_next[j] = True
-            if feasible_next.any():
-                a_next = qtab.greedy_action(next_state, mask=feasible_next)
-            else:
-                a_next = action
-
-            quantile_td_update(qtab, state, action, -reward, next_state, a_next, gamma=gamma, lr=lr)
-
-            state = next_state
-            if done:
-                eps_time[i_episode] = time.time() - start
+        for hop in range(max_hops):
+            feasible = _feasible_actions(G, state, deadline)
+            if not feasible:
+                # infeasible—episode ends (missed deadline)
+                done = True
+                # negative terminal depends only on accumulated step costs (already summed)
                 break
 
-        # ==== write artifacts like mc_prediction does ====
-        # Q_values.csv — we’ll log the mean of quantiles so plots keep working
-        with open(filename + "Q_values.csv", "a+", newline="") as f:
-            w = csv.writer(f)
-            for s in range(G.number_of_nodes()):
-                means = qtab.mean(s)
-                row = [i_episode, s] + [means[a] for a in range(G.number_of_nodes())]
-                w.writerow(row)
+            # ε-greedy on expected return
+            if rng.random() < eps:
+                action = int(rng.choice(feasible))
+            else:
+                action = greedy_action(Z, state, feasible)
 
-        # best_path.csv — follow greedy means from source to sink
-        with open(filename + "best_path.csv", "a+", newline="") as f:
-            w = csv.writer(f)
-            row = [i_episode, G.nodes[0]['name']]
-            s = 0
-            visited = set()
-            for _ in range(G.number_of_nodes()):
-                # mask: successors only
-                mask = np.zeros(G.number_of_nodes(), dtype=bool)
-                for j in G[int(s)]:
-                    mask[j] = True
-                if not mask.any():
-                    break
-                a = qtab.greedy_action(s, mask=mask)
-                row.append(G.nodes[int(a)]['name'])
-                s = a
-                if s == G.number_of_nodes() - 1 or s in visited:
-                    break
-                visited.add(s)
-            w.writerow(row)
+            # draw time for this edge from experiment-specific sampler
+            tx = float(make_time_sampler(state, action))
+            tx = max(0.0, tx)
 
-        # chosen_path.csv is trickier without storing the episode; optional
-        # tx_times.csv
-        with open(filename + "tx_times.csv", "a+", newline="") as f:
-            csv.writer(f).writerow([i_episode, total_time])
+            # shaped per-step reward
+            r = -tx
 
-        np.savetxt(filename + "comp_times.csv", eps_time, delimiter=",")
-    return qtab
+            total_time += tx
+            _, _, reached, _ = env.step(action, tx)
+            next_state = action  # env returns action as "state" per your env; next state is the action/node
+            deadline = env.get_deadline()  # already reduced inside env by tx
+
+            # terminal check (destination OR no more hops OR infeasible)
+            done = bool(reached)
+            # store transition
+            Replay.append((state, action, r, next_state, done))
+            total_steps += 1
+
+            # learning
+            if total_steps >= learn_start and len(Replay) >= batch_size:
+                batch = random.sample(Replay, batch_size)
+
+                # for each sample, do tabular quantile TD update
+                for (s, a, r_s, ns, d_s) in batch:
+                    # build target quantiles: r + gamma * Z_tgt[ns, a*] where a* is greedy on expected Z
+                    if d_s:
+                        # terminal bonus if success and within deadline
+                        # NOTE: we can only compute slack at episode end; approximate using env rule:
+                        # if destination reached, remaining deadline is env.deadline; slack = max(deadline,0)
+                        # Here we can’t access per-sample slack; use a mild bonus that encourages shorter paths.
+                        bonus = 0.0  # true slack is applied at episode end below; keep target clean for stability
+                        target = r_s + bonus
+                        target_z = np.full(K, target, dtype=np.float64)
+                    else:
+                        feas_ns = _feasible_actions(G, ns, env.get_deadline())
+                        if feas_ns:
+                            # greedy next action under TARGET net by expected value
+                            next_vals = np.array([np.mean(get_quantiles(Z_tgt, ns, na)) for na in feas_ns])
+                            na = feas_ns[int(np.argmax(next_vals))]
+                            z_next = get_quantiles(Z_tgt, ns, na)  # shape [K]
+                        else:
+                            z_next = np.zeros(K, dtype=np.float64)
+                        target_z = r_s + (gamma * z_next)
+
+                    z_pred = get_quantiles(Z, s, a)  # [K]
+                    # td matrix: [K_pred, K_tgt]
+                    td = target_z[None, :] - z_pred[:, None]
+                    grad, _ = _huber_quantile_gradient(td, taus, kappa=kappa)
+                    # SGD step on quantiles
+                    new_z = z_pred - lr * grad
+                    set_quantiles_(Z, s, a, new_z)
+
+                # soft target update (tabular)
+                if target_update_every > 0 and (total_steps % target_update_every) == 0:
+                    for s in list(Z.keys()):
+                        for a in list(Z[s].keys()):
+                            Z_tgt[s][a] = (1.0 - tau_target) * Z_tgt[s][a] + tau_target * Z[s][a]
+
+            if done:
+                break
+
+            state = next_state
+
+        # true terminal slack bonus (added *after* episode roll-out)
+        # write one synthetic transition so the agent experiences slack; optional but helps convergence
+        if total_time <= Final_deadline:
+            slack = Final_deadline - total_time
+            term_r = omega * slack
+        else:
+            term_r = 0.0
+
+        if total_steps >= learn_start:
+            # add a terminal self-transition to propagate slack to last state-action
+            # We approximate last (s,a) by reusing the last stored transition if exists
+            if Replay:
+                s, a, r_last, ns, d_last = Replay[-1]
+                target_z = np.full(K, term_r, dtype=np.float64)  # no bootstrap
+                z_pred = get_quantiles(Z, s, a)
+                td = target_z[None, :] - z_pred[:, None]
+                grad, _ = _huber_quantile_gradient(td, taus, kappa=kappa)
+                new_z = z_pred - lr * grad
+                set_quantiles_(Z, s, a, new_z)
+                # soft-update once more
+                for ss in list(Z.keys()):
+                    for aa in list(Z[ss].keys()):
+                        Z_tgt[ss][aa] = (1.0 - tau_target) * Z_tgt[ss][aa] + tau_target * Z[ss][aa]
+
+        # CSV logging for TeX
+        if tx_writer is not None:
+            tx_writer.writerow([ep, total_time])
+
+        ep_comp_time[ep] = time.time() - t0
+
+    # save comp_times.csv (seconds per episode index)
+    if results_dir:
+        np.savetxt(os.path.join(results_dir, "comp_times.csv"), ep_comp_time, delimiter=",")
+
+    return Z  # policy is implicit: greedy on mean(Z)

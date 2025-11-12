@@ -19,12 +19,12 @@ def make_time_sampler(state, action):
 
 _ = run_quantile_learning(
     make_time_sampler,
-    env, G,
-    Final_deadline=deadline,
-    num_episodes=num_episodes,
-    omega=omega,
+    env, G, deadline, num_episodes,
+    omega=omega,        #kept for completeness; trainer uses lr
     epsilon0=0.2,
     gamma=1.0,
-    lr=5e-3,
-    K=51
+    lr=2e-3,
+    K=31,
+    tau_target=0.01
 )
+

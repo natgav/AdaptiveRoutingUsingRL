@@ -19,4 +19,15 @@ def make_time_sampler(state, action):
     mu, sigma = G[int(state)][int(action)]["tx"], variance
     return stats.truncnorm.rvs((lower - mu)/sigma, (upper - mu)/sigma, loc=mu, scale=sigma)
 
-_ = run_quantile_learning(make_time_sampler, env, G, deadline, num_episodes, omega=omega, epsilon0=0.2, gamma=1.0, lr=5e-3, K=51)
+#_ = run_quantile_learning(make_time_sampler, env, G, deadline, num_episodes, omega=omega, epsilon0=0.2, gamma=1.0, lr=5e-3, K=51)
+
+_ = run_quantile_learning(
+    make_time_sampler,
+    env, G, deadline, num_episodes,
+    omega=omega,        # kept for completeness; trainer uses lr
+    epsilon0=0.2,
+    gamma=1.0,
+    lr=2e-3,
+    K=31,
+    tau_target=0.01
+)
